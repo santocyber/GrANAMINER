@@ -1,8 +1,18 @@
-#include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
 #include <Crypto.h>
 #include <SHA256.h>
+#include <esp_task_wdt.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <esp_system.h>
+#include "WebServer.h"
+#include <TFT_eSPI.h>
+
+
+
+#define CONFIG_FILE "/wifi_config.txt"
+#define MAX_WIFI_ATTEMPTS 3
 
 // Configurações do display
 TFT_eSPI tft = TFT_eSPI();
@@ -11,8 +21,10 @@ String lines[MAX_LINES]; // Buffer para linhas de texto
 int screenLine = 0; // Linha inicial para exibição no display
 
 // Configurações de rede WiFi
-const char* ssid = "InternetSA";
-const char* password = "cadebabaca";
+String ssid, password, username, botname;
+bool conectadoweb = false;
+int wifiAttempts = 0;
+int connectionAttempts = 0;
 
 // Configurações da Antpool
 const char* stratumServer = "ss.antpool.com";
@@ -39,11 +51,21 @@ JsonArray merkleBranches;
 String previousBlockHash;
 String version;
 
-// Contador de tentativas de conexão
-int connectionAttempts = 0;
+// Variáveis para configuração web
+String networksList;
+bool loopweb = false;
+unsigned long previousMillis = 0;
+
+WebServer server(80);
+
 
 void setup() {
   Serial.begin(115200);
+  
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Failed to mount file system");
+    return;
+  }
 
   // Iniciar o display
   tft.init();
@@ -53,56 +75,84 @@ void setup() {
 
   // Mostrar logo na inicialização
   showLogo();
+  setupWEB();
 
-  // Conectar ao WiFi
-  connectToWiFi();
+    //esp_task_wdt_init(&config);
+
+
+   // Redefinir o timeout do watchdog timer para 10 segundos
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 20000, // Timeout de 10000 milissegundos (10 segundos)
+    .idle_core_mask = 1,
+    .trigger_panic = true,
+  };
+  esp_task_wdt_reconfigure(&wdt_config);
+
+  // Adicionar a tarefa principal ao watchdog timer, se ainda não estiver adicionada
+
+      xTaskCreatePinnedToCore(task_feed_wdt, "task_feed_wdt_core0", configMINIMAL_STACK_SIZE * 2, NULL, 5, NULL, 1);
+
+}
+
+
+void task_feed_wdt(void *pvParameter) {
+    esp_task_wdt_add(NULL);
+
+    while (1) {
+        vTaskDelay(15000 / portTICK_PERIOD_MS);
+        esp_task_wdt_reset();
+        Serial.println("WDT alimentado pelo core 0");
+    }
 }
 
 void loop() {
-  // Verificar o status da conexão WiFi e reconectar se necessário
-  if (WiFi.status() != WL_CONNECTED) {
-    tft.fillScreen(TFT_BLACK);
-    screenLine = 2;
-    clearScreen();
-    logToScreen("WiFi desconectado!");
-    logToScreen("Tentando reconectar...");
-    Serial.println("WiFi desconectado! Tentando reconectar...");
-    connectToWiFi();
-  } else if (!client.connected()) {
-    // Conectar ao servidor Stratum se desconectado
-    connectToStratum();
-  } else {
-    // Executar mineração se conectado ao servidor Stratum
+  // Reiniciar o Watchdog Timer
+  loopWEB();
+
+  // Executar lógica de mineração se conectado ao servidor Stratum
+  if (conectadoweb) {
     mineBitcoin();
+    delay(1000);
   }
-  delay(1000);
+
 }
 
 void connectToWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE); // Reset IP configuration
-  WiFi.setDNS(IPAddress(8, 8, 8, 8), IPAddress(8, 8, 4, 4)); // Set DNS servers
-  WiFi.begin(ssid, password);
-
   tft.fillScreen(TFT_BLACK);
   screenLine = 2;
   clearScreen();
-  logToScreen("Conectando ao WiFi...");
+  logToScreen("Tentando conectar ao WiFi: " + ssid);
 
-  Serial.println("Conectando ao WiFi...");
+  Serial.println("Tentando conectar ao WiFi...");
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  unsigned long startAttemptTime = millis();
+  const unsigned long wifiTimeout = 10000; // Tempo limite para tentar conectar ao WiFi (10 segundos)
+
+  while (WiFi.status() != WL_CONNECTED && (millis() - startAttemptTime) < wifiTimeout) {
+    delay(500);
     Serial.print(".");
     tft.print(".");
   }
 
-  Serial.println("\nConectado!");
-  logToScreen("WiFi conectado!");
-  logToScreen("Iniciando mineracao...");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConectado!");
+    logToScreen("WiFi conectado!");
+    conectadoweb = true;
+    logToScreen("Iniciando mineracao...");
 
-  // Conectar ao servidor Stratum após conexão WiFi
-  connectToStratum();
+    // Conectar ao servidor Stratum após conexão WiFi
+    connectToStratum();
+  } else {
+    Serial.println("\nFalha ao conectar ao WiFi.");
+    logToScreen("Falha ao conectar ao WiFi.");
+    wifiAttempts++;
+
+    if (wifiAttempts >= MAX_WIFI_ATTEMPTS) {
+      setupAP();
+    }
+  }
 }
 
 void connectToStratum() {
@@ -239,7 +289,7 @@ void mineBlock() {
     sha256.finalize(hashBin, sizeof(hashBin));
 
     hash = "";
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0;  i < 32; i++) {
       char hex[3];
       sprintf(hex, "%02x", hashBin[i]);
       hash += String(hex);
@@ -375,7 +425,7 @@ void showLogo() {
   tft.setTextColor(TFT_GREEN);
 
   // Dimensões do texto "GrANA MINER"
-  int logoWidth = 170; // Aproximadamente 10 caracteres em tamanho 4 (cada caractere tem cerca de 17 pixels de largura)
+  int logoWidth = 220; // Aproximadamente 10 caracteres em tamanho 4 (cada caractere tem cerca de 17 pixels de largura)
   int logoHeight = 32; // Aproximadamente 8 pixels por tamanho de texto (4 * 8)
 
   // Centralizar o texto horizontalmente e verticalmente
@@ -395,12 +445,23 @@ void showLogo() {
   tft.setTextSize(2);
   tft.println("by SantoCyber");
 
+     // Carrega o patternIndex do SPIFFS
+  int patternIndex = loadPatternIndex();
+  drawPattern(patternIndex);
+
+  // Incrementa o índice e salva no SPIFFS
+  patternIndex = (patternIndex + 1) % 5;
+  savePatternIndex(patternIndex);
+
+
+
+  /*
   // Centralizar o efeito animado
-  for (int i = 0; i < tft.height(); i += 10) {
-    tft.drawLine((tft.width() / 2) - i, 0, (tft.width() / 2) + i, tft.height(), TFT_GREEN);
+  for (int i = 0; i < 900; i += 5) {
+    tft.drawLine((tft.width() / 2) - i, 0 , (tft.width() / 2) + i, tft.height() ^ i / 2 , TFT_GREEN);
     delay(50);
   }
-
-  delay(2000);
+*/
+  delay(500);
   tft.fillScreen(TFT_BLACK);
 }
