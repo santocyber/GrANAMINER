@@ -9,8 +9,6 @@
 #include "WebServer.h"
 #include <TFT_eSPI.h>
 
-
-
 #define CONFIG_FILE "/wifi_config.txt"
 #define MAX_WIFI_ATTEMPTS 3
 
@@ -38,6 +36,7 @@ WiFiClient client;
 unsigned long lastHashTime = 0;
 unsigned long hashCount = 0;
 float hashRate = 0;
+String networkDifficulty;
 
 // Variáveis para mineração
 String jobId;
@@ -56,12 +55,26 @@ String networksList;
 bool loopweb = false;
 unsigned long previousMillis = 0;
 
-WebServer server(80);
+WebServer server(80); // Servidor web
 
+// Buffer alocado na PSRAM
+DynamicJsonDocument* doc = nullptr;
 
 void setup() {
   Serial.begin(115200);
-  
+
+  // Inicializar PSRAM
+  if (psramFound()) {
+    doc = new (ps_malloc(sizeof(DynamicJsonDocument))) DynamicJsonDocument(16384); // Alocar 16KB na PSRAM
+  } else {
+    doc = new DynamicJsonDocument(2048); // Usar heap normal se PSRAM não estiver disponível
+  }
+
+  if (doc == nullptr) {
+    Serial.println("Falha ao alocar memória para doc.");
+    return;
+  }
+
   if (!SPIFFS.begin(true)) {
     Serial.println("Failed to mount file system");
     return;
@@ -69,7 +82,7 @@ void setup() {
 
   // Iniciar o display
   tft.init();
-  tft.setRotation(1);
+  tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
   tft.setTextWrap(true);
 
@@ -77,44 +90,25 @@ void setup() {
   showLogo();
   setupWEB();
 
-    //esp_task_wdt_init(&config);
-
-
-   // Redefinir o timeout do watchdog timer para 10 segundos
+  // Configurar o watchdog timer
   esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = 20000, // Timeout de 10000 milissegundos (10 segundos)
+    .timeout_ms = 120000, // Timeout de 120 segundos
     .idle_core_mask = 1,
     .trigger_panic = true,
   };
   esp_task_wdt_reconfigure(&wdt_config);
+  esp_task_wdt_add(NULL);
 
-  // Adicionar a tarefa principal ao watchdog timer, se ainda não estiver adicionada
-
-      xTaskCreatePinnedToCore(task_feed_wdt, "task_feed_wdt_core0", configMINIMAL_STACK_SIZE * 2, NULL, 5, NULL, 1);
-
-}
-
-
-void task_feed_wdt(void *pvParameter) {
-    esp_task_wdt_add(NULL);
-
-    while (1) {
-        vTaskDelay(15000 / portTICK_PERIOD_MS);
-        esp_task_wdt_reset();
-        Serial.println("WDT alimentado pelo core 0");
-    }
+  connectToWiFi();
 }
 
 void loop() {
-  // Reiniciar o Watchdog Timer
+  esp_task_wdt_reset();
   loopWEB();
-
-  // Executar lógica de mineração se conectado ao servidor Stratum
   if (conectadoweb) {
     mineBitcoin();
-    delay(1000);
   }
-
+  delay(1000);
 }
 
 void connectToWiFi() {
@@ -128,7 +122,7 @@ void connectToWiFi() {
   WiFi.begin(ssid.c_str(), password.c_str());
 
   unsigned long startAttemptTime = millis();
-  const unsigned long wifiTimeout = 10000; // Tempo limite para tentar conectar ao WiFi (10 segundos)
+  const unsigned long wifiTimeout = 3000; // Tempo limite para tentar conectar ao WiFi (3 segundos)
 
   while (WiFi.status() != WL_CONNECTED && (millis() - startAttemptTime) < wifiTimeout) {
     delay(500);
@@ -151,6 +145,9 @@ void connectToWiFi() {
 
     if (wifiAttempts >= MAX_WIFI_ATTEMPTS) {
       setupAP();
+    } else {
+      delay(5000); // Esperar antes de tentar conectar novamente
+      connectToWiFi();
     }
   }
 }
@@ -166,6 +163,9 @@ void connectToStratum() {
       Serial.println("Falhou ao conectar 5 vezes. Reiniciando o ESP...");
       logToScreen("Falhou ao conectar 5 vezes. Reiniciando o ESP...");
       ESP.restart();
+    } else {
+      delay(5000); // Esperar antes de tentar conectar novamente
+      connectToStratum();
     }
     return;
   }
@@ -195,8 +195,7 @@ void connectToStratum() {
     logToScreen("Recebido: " + response);
 
     // Parse JSON response
-    DynamicJsonDocument doc(2048);
-    DeserializationError error = deserializeJson(doc, response);
+    DeserializationError error = deserializeJson(*doc, response);
 
     if (error) {
       Serial.print("Erro ao analisar JSON: ");
@@ -206,49 +205,21 @@ void connectToStratum() {
     }
 
     // Verificar se é uma resposta de subscribe
-    if (doc.containsKey("result") && doc["result"].is<JsonArray>()) {
-      JsonArray result = doc["result"];
+    if (doc->containsKey("result") && (*doc)["result"].is<JsonArray>()) {
+      JsonArray result = (*doc)["result"];
       if (result.size() > 1 && result[1].is<String>()) {
         extranonce1 = result[1].as<String>();
       }
     }
-  }
-}
 
-void mineBitcoin() {
-  // Receber dados do servidor Stratum
-  String response = readStratumResponse();
-  if (response.length() > 0) {
-    Serial.println("Recebido: " + response);
-    logToScreen("Recebido: " + response);
-
-    // Parse JSON response
-    DynamicJsonDocument doc(2048);
-    DeserializationError error = deserializeJson(doc, response);
-
-    if (error) {
-      Serial.print("Erro ao analisar JSON: ");
-      Serial.println(error.c_str());
-      logToScreen("Erro ao analisar JSON: " + String(error.c_str()));
-      return;
-    }
-
-    // Verificar se é um trabalho de mineração
-    if (doc.containsKey("method") && doc["method"] == "mining.notify") {
-      jobId = doc["params"][0].as<String>();
-      previousBlockHash = doc["params"][1].as<String>();
-      coinbase1 = doc["params"][2].as<String>();
-      coinbase2 = doc["params"][3].as<String>();
-      merkleBranches = doc["params"][4].as<JsonArray>();
-      version = doc["params"][5].as<String>();
-      nbits = doc["params"][6].as<String>();
-      ntime = doc["params"][7].as<String>();
-
-      // Gerar extranonce2
-      extranonce2 = String(random(0xFFFFFFFF), HEX); // Extranonce2 gerado aleatoriamente
-
-      // Realizar mineração com os dados recebidos
-      mineBlock();
+    // Verificar se é uma notificação de dificuldade e de trabalho
+    if (doc->containsKey("method")) {
+      String method = (*doc)["method"].as<String>();
+      if (method == "mining.notify") {
+        handleMiningNotify(*doc);
+      } else if (method == "mining.set_difficulty") {
+        handleSetDifficulty(*doc);
+      }
     }
   }
 }
@@ -261,7 +232,49 @@ String readStratumResponse() {
   return response;
 }
 
-void mineBlock() {
+void handleMiningNotify(DynamicJsonDocument &doc) {
+  if (!doc.containsKey("params") || !doc["params"].is<JsonArray>()) {
+    Serial.println("Resposta de mineração inválida");
+    return;
+  }
+
+  JsonArray params = doc["params"];
+  if (params.size() < 9) {
+    Serial.println("Parâmetros de mineração inválidos");
+    return;
+  }
+
+  jobId = params[0].as<String>();
+  previousBlockHash = params[1].as<String>();
+  coinbase1 = params[2].as<String>();
+  coinbase2 = params[3].as<String>();
+  merkleBranches = params[4].as<JsonArray>();
+  version = params[5].as<String>();
+  nbits = params[6].as<String>();
+  ntime = params[7].as<String>();
+
+  // Log to check parameters
+  Serial.println("Job ID: " + jobId);
+  Serial.println("Previous Block Hash: " + previousBlockHash);
+  Serial.println("Coinbase 1: " + coinbase1);
+  Serial.println("Coinbase 2: " + coinbase2);
+  Serial.println("Version: " + version);
+  Serial.println("Nbits: " + nbits);
+  Serial.println("Ntime: " + ntime);
+}
+
+void handleSetDifficulty(DynamicJsonDocument &doc) {
+  if (doc.containsKey("params") && doc["params"].is<JsonArray>()) {
+    JsonArray params = doc["params"];
+    networkDifficulty = params[0].as<String>();
+    Serial.println("Dificuldade da rede: " + networkDifficulty);
+    logToScreen("Dificuldade da rede: " + networkDifficulty);
+  }
+}
+
+void mineBitcoin() {
+  esp_task_wdt_reset();
+
   uint32_t nonce = 0;
   String hash = "";
   uint8_t hashBin[32]; // SHA-256 produces a 32-byte hash
@@ -270,6 +283,8 @@ void mineBlock() {
   hashCount = 0;
 
   while (true) {
+    esp_task_wdt_reset();
+
     String coinbase = coinbase1 + extranonce1 + extranonce2 + coinbase2;
     String coinbaseHash = sha256(coinbase);
     String merkleRoot = coinbaseHash;
@@ -289,7 +304,7 @@ void mineBlock() {
     sha256.finalize(hashBin, sizeof(hashBin));
 
     hash = "";
-    for (int i = 0;  i < 32; i++) {
+    for (int i = 0; i < 32; i++) {
       char hex[3];
       sprintf(hex, "%02x", hashBin[i]);
       hash += String(hex);
@@ -374,6 +389,7 @@ void submitBlock(uint32_t nonce) {
   client.print(submitMessage);
   Serial.println("Enviado: " + submitMessage);
   logToScreen("Enviado: " + submitMessage);
+  esp_task_wdt_reset();
 }
 
 void logToScreen(String message) {
@@ -401,11 +417,13 @@ void redrawScreen() {
   tft.setCursor(10, 8);
   tft.println("GrANA MINER");
 
-  // Desenha o hashrate com espaçamento de 50 pixels
+  // Desenha o hashrate e a dificuldade da rede
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.setCursor(150, 10); // Ajustado com espaçamento de 50 pixels
   tft.setTextSize(2);
   tft.println("Hashrate: " + String(hashRate, 2) + " H/s");
+  tft.setCursor(150, 30);
+  tft.println("DF: " + networkDifficulty);
 
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
@@ -445,23 +463,16 @@ void showLogo() {
   tft.setTextSize(2);
   tft.println("by SantoCyber");
 
-     // Carrega o patternIndex do SPIFFS
-  int patternIndex = loadPatternIndex();
-  drawPattern(patternIndex);
-
-  // Incrementa o índice e salva no SPIFFS
-  patternIndex = (patternIndex + 1) % 5;
-  savePatternIndex(patternIndex);
-
-
-
-  /*
-  // Centralizar o efeito animado
-  for (int i = 0; i < 900; i += 5) {
-    tft.drawLine((tft.width() / 2) - i, 0 , (tft.width() / 2) + i, tft.height() ^ i / 2 , TFT_GREEN);
-    delay(50);
-  }
-*/
   delay(500);
   tft.fillScreen(TFT_BLACK);
+}
+
+void task_feed_wdt(void *pvParameter) {
+  esp_task_wdt_add(NULL);
+
+  while (1) {
+    vTaskDelay(30000 / portTICK_PERIOD_MS);
+    esp_task_wdt_reset();
+    Serial.println("WDT alimentado pelo core 0");
+  }
 }
