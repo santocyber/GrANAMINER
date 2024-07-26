@@ -4,7 +4,7 @@
 #include <Crypto.h>
 #include <SHA256.h>
 
-// Configurações do display TFT_eSPI
+// Configurações do display
 TFT_eSPI tft = TFT_eSPI();
 #define MAX_LINES 16
 String lines[MAX_LINES]; // Buffer para linhas de texto
@@ -38,6 +38,9 @@ String coinbase2;
 JsonArray merkleBranches;
 String previousBlockHash;
 String version;
+
+// Contador de tentativas de conexão
+int connectionAttempts = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -106,8 +109,19 @@ void connectToStratum() {
   if (!client.connect(stratumServer, stratumPort)) {
     Serial.println("Falha ao conectar ao servidor Stratum.");
     logToScreen("Falha ao conectar ao servidor Stratum.");
+    connectionAttempts++;
+
+    // Verificar se atingiu o limite de tentativas
+    if (connectionAttempts >= 5) {
+      Serial.println("Falhou ao conectar 5 vezes. Reiniciando o ESP...");
+      logToScreen("Falhou ao conectar 5 vezes. Reiniciando o ESP...");
+      ESP.restart();
+    }
     return;
   }
+
+  // Resetar contador de tentativas após conexão bem-sucedida
+  connectionAttempts = 0;
 
   // Enviar mensagem de autenticação
   String authMessage = "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": []}\n";
@@ -329,23 +343,23 @@ void clearScreen() {
 
 void redrawScreen() {
   tft.fillScreen(TFT_BLACK);
-  
+
   // Desenha o logo
-  tft.fillRect(0, 0, 130, 30, TFT_GREEN);
+  tft.fillRect(0, 0, 145, 30, TFT_GREEN);
   tft.setTextColor(TFT_BLACK, TFT_GREEN);
   tft.setTextSize(2);
-  tft.setCursor(10, 5);
+  tft.setCursor(10, 8);
   tft.println("GrANA MINER");
-  
+
   // Desenha o hashrate com espaçamento de 50 pixels
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.setCursor(180, 0); // Ajustado com espaçamento de 50 pixels
+  tft.setCursor(150, 10); // Ajustado com espaçamento de 50 pixels
   tft.setTextSize(2);
   tft.println("Hashrate: " + String(hashRate, 2) + " H/s");
-  
+
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
-  
+
   for (int i = 0; i < MAX_LINES; i++) {
     tft.setCursor(0, (i + 2) * 16);
     tft.println(lines[i]);
@@ -359,34 +373,34 @@ void displayHashRate() {
 void showLogo() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_GREEN);
-  
+
   // Dimensões do texto "GrANA MINER"
   int logoWidth = 170; // Aproximadamente 10 caracteres em tamanho 4 (cada caractere tem cerca de 17 pixels de largura)
   int logoHeight = 32; // Aproximadamente 8 pixels por tamanho de texto (4 * 8)
-  
+
   // Centralizar o texto horizontalmente e verticalmente
   int x = (tft.width() - logoWidth) / 2;
   int y = (tft.height() - logoHeight) / 2 - 20; // Ajustar para a metade da altura e um pouco acima
   tft.setCursor(x, y);
   tft.setTextSize(4);
   tft.println("GrANA MINER");
-  
+
   // Dimensões do texto "by SantoCyber"
   int subtextWidth = 132; // Aproximadamente 11 caracteres em tamanho 2 (cada caractere tem cerca de 12 pixels de largura)
   int subtextHeight = 16; // Aproximadamente 8 pixels por tamanho de texto (2 * 8)
-  
+
   x = (tft.width() - subtextWidth) / 2;
   y = (tft.height() - subtextHeight) / 2 + 20; // Ajustar para a metade da altura e um pouco abaixo
   tft.setCursor(x, y);
   tft.setTextSize(2);
   tft.println("by SantoCyber");
-  
+
   // Centralizar o efeito animado
   for (int i = 0; i < tft.height(); i += 10) {
     tft.drawLine((tft.width() / 2) - i, 0, (tft.width() / 2) + i, tft.height(), TFT_GREEN);
     delay(50);
   }
-  
+
   delay(2000);
   tft.fillScreen(TFT_BLACK);
 }
