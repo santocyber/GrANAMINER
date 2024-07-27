@@ -1,6 +1,3 @@
-
-
-
 void scanNetworks() {
   Serial.println("Scanning WiFi networks");
   //WiFi.disconnect(true); // Desativa a reconexão automática
@@ -27,8 +24,8 @@ void setupWEB() {
 
   if (ssid.length() > 0) {
     tft.fillScreen(TFT_BLACK);
-    logToScreen("Arquivo de configuração encontrado.");
-    logToScreen("Tentando conectar ao WiFi...");
+    logToScreen("Arquivo de configuração encontrado.", TFT_WHITE, 1);
+    logToScreen("Tentando conectar ao WiFi...", TFT_WHITE, 1);
     delay(500);
     connectToWiFi();
   } else {
@@ -55,7 +52,7 @@ void setupAP() {
   Serial.println(apIP);
 
   setupWebServer();
-  logToScreen("Modo AP ativado. Conecte-se ao SSID 'GrANACONFIG'.");
+  logToScreen("Modo AP ativado. Conecte-se ao SSID 'GrANACONFIG'.", TFT_WHITE, 1);
 
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE);
@@ -92,13 +89,7 @@ void loopWEB() {
   if (loopweb) {
     server.handleClient();
   }
-
-
 }
-
-
-
-
 
 void restartEsp() {
   server.send(200, "text/plain", "restarting...");

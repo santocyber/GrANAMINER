@@ -8,6 +8,9 @@
 #include <esp_system.h>
 #include "WebServer.h"
 #include <TFT_eSPI.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
 
 #define CONFIG_FILE "/wifi_config.txt"
 #define MAX_WIFI_ATTEMPTS 3
@@ -15,7 +18,12 @@
 // Configurações do display
 TFT_eSPI tft = TFT_eSPI();
 #define MAX_LINES 16
-String lines[MAX_LINES]; // Buffer para linhas de texto
+struct Line {
+  String text;
+  uint16_t color;
+  uint8_t textSize;
+};
+Line lines[MAX_LINES]; // Buffer para linhas de texto
 int screenLine = 0; // Linha inicial para exibição no display
 
 // Configurações de rede WiFi
@@ -25,9 +33,9 @@ int wifiAttempts = 0;
 int connectionAttempts = 0;
 
 // Configurações da Antpool
-const char* stratumServer = "ss.antpool.com";
+const char* stratumServer = "solo.ckpool.org";
 const int stratumPort = 3333;
-const char* workerName = "santocyber";
+const char* workerName = "1EhGEPUDoUHqi9c2TQbwKMq6cnNVjpBqQF";
 const char* workerPassword = "x"; // Antpool usa 'x' como senha por padrão
 
 WiFiClient client;
@@ -48,15 +56,22 @@ String coinbase2;
 JsonArray merkleBranches;
 String previousBlockHash;
 String version;
+int difficulty;
 
 // Variáveis para configuração web
 String networksList;
 bool loopweb = false;
 unsigned long previousMillis = 0;
 unsigned long lastCommunicationMillis = 0;
+unsigned long lastScreenUpdateMillis = 0; // Tempo da última atualização da tela
 
 WebServer server(80);
 TaskHandle_t miningMonitorTaskHandle = NULL;
+
+// Configurações do NTP
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, IPAddress(129, 6, 15, 28), -3 * 3600); // IP do servidor NTP
+String timeStamp;
 
 void setup() {
   Serial.begin(115200);
@@ -76,6 +91,9 @@ void setup() {
   showLogo();
   setupWEB();
 
+  // Inicializar o NTP
+  timeClient.begin();
+
   // Redefinir o timeout do watchdog timer para 10 segundos
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = 120000, // Timeout de 120000 milissegundos (120 segundos)
@@ -89,7 +107,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     miningMonitorTask,    // Função da tarefa
     "MiningMonitorTask",  // Nome da tarefa
-    10000,                // Tamanho da pilha da tarefa
+    2000,                // Tamanho da pilha da tarefa
     NULL,                 // Parâmetro da tarefa
     1,                    // Prioridade da tarefa
     &miningMonitorTaskHandle, // Handle da tarefa
@@ -112,14 +130,17 @@ void loop() {
 
 void miningMonitorTask(void *parameter) {
   while (true) {
-    // Verificar se houve comunicação nos últimos 60 segundos
-    if (millis() - lastCommunicationMillis > 60000) {
-      Serial.println("Nenhuma comunicação em 60 segundos, reiniciando o ESP...");
+    // Verificar se houve comunicação nos últimos 120 segundos
+    if (millis() - lastCommunicationMillis > 120000) {
+      Serial.println("Nenhuma comunicação em 120 segundos, reiniciando o ESP...");
+      delay(10000);
       ESP.restart();
     }
-    Serial.println("FUNCAO MONITOR TASK");
-
-    vTaskDelay(10000 / portTICK_PERIOD_MS); // Verificar a cada 10 segundos
+if (WiFi.status() == WL_CONNECTED) {
+    // Atualizar a hora a partir do servidor NTP
+    updateTimeFromNTP();
+}
+    vTaskDelay(60000 / portTICK_PERIOD_MS); // Verificar a cada 10 minutos
   }
 }
 
@@ -127,7 +148,7 @@ void connectToWiFi() {
   tft.fillScreen(TFT_BLACK);
   screenLine = 2;
   clearScreen();
-  logToScreen("Tentando conectar ao WiFi: " + ssid);
+  logToScreen("Tentando conectar ao WiFi: " + ssid, TFT_WHITE, 1);
 
   Serial.println("Tentando conectar ao WiFi...");
 
@@ -144,15 +165,15 @@ void connectToWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nConectado!");
-    logToScreen("WiFi conectado!");
+    logToScreen("WiFi conectado!", TFT_WHITE, 1);
     conectadoweb = true;
-    logToScreen("Iniciando mineracao...");
+    logToScreen("Iniciando mineracao...", TFT_WHITE, 1);
 
     // Conectar ao servidor Stratum após conexão WiFi
     connectToStratum();
   } else {
     Serial.println("\nFalha ao conectar ao WiFi.");
-    logToScreen("Falha ao conectar ao WiFi.");
+    logToScreen("Falha ao conectar ao WiFi.", TFT_RED, 1);
     wifiAttempts++;
 
     if (wifiAttempts >= MAX_WIFI_ATTEMPTS) {
@@ -164,13 +185,13 @@ void connectToWiFi() {
 void connectToStratum() {
   if (!client.connect(stratumServer, stratumPort)) {
     Serial.println("Falha ao conectar ao servidor Stratum.");
-    logToScreen("Falha ao conectar ao servidor Stratum.");
+    logToScreen("Falha ao conectar ao servidor Stratum.", TFT_RED, 1);
     connectionAttempts++;
 
     // Verificar se atingiu o limite de tentativas
     if (connectionAttempts >= 5) {
       Serial.println("Falhou ao conectar 5 vezes. Reiniciando o ESP...");
-      logToScreen("Falhou ao conectar 5 vezes. Reiniciando o ESP...");
+      logToScreen("Falhou ao conectar 5 vezes. Reiniciando o ESP...", TFT_RED, 1);
       ESP.restart();
     }
     return;
@@ -183,14 +204,14 @@ void connectToStratum() {
   String authMessage = "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": []}\n";
   client.print(authMessage);
   Serial.println("Enviado: " + authMessage);
-  logToScreen("Enviado: " + authMessage);
+  logToScreen("Enviado: " + authMessage, TFT_ORANGE, 1);
 
   delay(1000);
 
   authMessage = String("{\"id\": 2, \"method\": \"mining.authorize\", \"params\": [\"") + workerName + "\", \"" + workerPassword + "\"]}\n";
   client.print(authMessage);
   Serial.println("Enviado: " + authMessage);
-  logToScreen("Enviado: " + authMessage);
+  logToScreen("Enviado: " + authMessage, TFT_ORANGE, 1);
 
   delay(1000);
 
@@ -198,7 +219,7 @@ void connectToStratum() {
   String response = readStratumResponse();
   if (response.length() > 0) {
     Serial.println("Recebido: " + response);
-    logToScreen("Recebido: " + response);
+    logToScreen("Recebido dados do servidor", TFT_WHITE, 1);
 
     // Parse JSON response
     DynamicJsonDocument doc(2048);
@@ -207,7 +228,7 @@ void connectToStratum() {
     if (error) {
       Serial.print("Erro ao analisar JSON: ");
       Serial.println(error.c_str());
-      logToScreen("Erro ao analisar JSON: " + String(error.c_str()));
+      logToScreen("Erro ao analisar JSON: " + String(error.c_str()), TFT_RED, 1);
       return;
     }
 
@@ -217,6 +238,14 @@ void connectToStratum() {
       if (result.size() > 1 && result[1].is<String>()) {
         extranonce1 = result[1].as<String>();
       }
+    }
+
+    // Verificar se é uma resposta de set_difficulty
+    if (doc.containsKey("method") && doc["method"] == "mining.set_difficulty") {
+      difficulty = doc["params"][0];
+      Serial.print("Nova dificuldade recebida: ");
+      Serial.println(difficulty);
+      logToScreen("Nova dificuldade: " + String(difficulty), TFT_RED, 2);
     }
   }
   // Atualizar o tempo da última comunicação
@@ -230,7 +259,7 @@ void mineBitcoin() {
   String response = readStratumResponse();
   if (response.length() > 0) {
     Serial.println("Recebido: " + response);
-    logToScreen("Recebido: " + response);
+    logToScreen("Recebido dados do servidor", TFT_WHITE, 1);
 
     // Parse JSON response
     DynamicJsonDocument doc(2048);
@@ -239,7 +268,7 @@ void mineBitcoin() {
     if (error) {
       Serial.print("Erro ao analisar JSON: ");
       Serial.println(error.c_str());
-      logToScreen("Erro ao analisar JSON: " + String(error.c_str()));
+      logToScreen("Erro ao analisar JSON: " + String(error.c_str()), TFT_RED, 1);
       return;
     }
 
@@ -254,15 +283,37 @@ void mineBitcoin() {
       nbits = doc["params"][6].as<String>();
       ntime = doc["params"][7].as<String>();
 
+      // Imprimir os parâmetros recebidos
+      Serial.println("Job ID: " + jobId);
+      Serial.println("Previous Block Hash: " + previousBlockHash);
+      Serial.println("Coinbase1: " + coinbase1);
+      Serial.println("Coinbase2: " + coinbase2);
+      Serial.println("Version: " + version);
+      Serial.println("Nbits: " + nbits);
+      Serial.println("Ntime: " + ntime);
+      Serial.println("Difficulty: " + String(difficulty)); // Exibir dificuldade
+
+      logToScreen("Job ID: " + jobId, TFT_WHITE, 1);
+      logToScreen("Previous Block Hash: " + previousBlockHash, TFT_WHITE, 1);
+      logToScreen("Coinbase1: " + coinbase1, TFT_WHITE, 1);
+      logToScreen("Coinbase2: " + coinbase2, TFT_WHITE, 1);
+      logToScreen("Version: " + version, TFT_WHITE, 1);
+      logToScreen("Nbits: " + nbits, TFT_WHITE, 1);
+      logToScreen("Ntime: " + ntime, TFT_WHITE, 1);
+      logToScreen("Difficulty: " + String(difficulty), TFT_RED, 1); // Exibir dificuldade
+
       // Gerar extranonce2
       extranonce2 = String(random(0xFFFFFFFF), HEX); // Extranonce2 gerado aleatoriamente
 
       // Realizar mineração com os dados recebidos
       mineBlock();
+    } else if (doc.containsKey("method") && doc["method"] == "mining.set_difficulty") {
+      difficulty = doc["params"][0];
+      Serial.print("Nova dificuldade recebida: ");
+      Serial.println(difficulty);
+      logToScreen("Nova dificuldade: " + String(difficulty), TFT_RED, 2);
     }
   }
-  // Atualizar o tempo da última comunicação
-  lastCommunicationMillis = millis();
 }
 
 String readStratumResponse() {
@@ -279,17 +330,19 @@ void mineBlock() {
   uint8_t hashBin[32]; // SHA-256 produces a 32-byte hash
 
   unsigned long startTime = millis();
+  unsigned long iterationStartTime = millis();
+  unsigned long totalIterations = 0;
   hashCount = 0;
 
   while (true) {
     esp_task_wdt_reset();
 
     String coinbase = coinbase1 + extranonce1 + extranonce2 + coinbase2;
-    String coinbaseHash = sha256(coinbase);
+    String coinbaseHash = calculateSha256(coinbase);
     String merkleRoot = coinbaseHash;
 
     for (int i = 0; i < merkleBranches.size(); i++) {
-      merkleRoot = sha256(merkleRoot + merkleBranches[i].as<String>());
+      merkleRoot = calculateSha256(merkleRoot + merkleBranches[i].as<String>());
     }
 
     SHA256 sha256;
@@ -311,6 +364,7 @@ void mineBlock() {
 
     // Incrementar contagem de hashes
     hashCount++;
+    totalIterations++;
 
     // Calcular o hashrate a cada segundo
     if (millis() - startTime >= 1000) {
@@ -320,24 +374,40 @@ void mineBlock() {
       displayHashRate();
     }
 
-    // Exibir o hash gerado
-    logToScreen("Hash: " + hash + " Nonce: " + String(nonce));
+    // Exibir o hash gerado se o tempo desde a última atualização da tela for maior que o intervalo definido
+    if (millis() - lastScreenUpdateMillis >= 4000) { // Atualiza a cada 1 segundo
+      logToScreen("Hash: " + hash + " Nonce: " + String(nonce), random(0xFFFF), 1);
+      lastScreenUpdateMillis = millis();
+    }
 
     Serial.print("Hash gerado: ");
     Serial.println(hash);
+    lastCommunicationMillis = millis();
 
     // Verificar se o hash gerado é válido
     if (isValidHash(hashBin, nbits)) {
-      logToScreen("Bloco encontrado!");
+      logToScreen("Bloco encontrado! Hora: " + timeStamp, TFT_GREEN, 3);
       submitBlock(nonce);
       break;
     }
 
+    // Incrementar nonce
     nonce++;
+
+    // Medir o tempo de 100 iterações para calcular o tempo médio por iteração
+    if (totalIterations % 100 == 0) {
+      unsigned long iterationEndTime = millis();
+      unsigned long elapsedTime = iterationEndTime - iterationStartTime;
+      float averageIterationTime = (float)elapsedTime / 100.0;
+      Serial.print("Tempo médio por iteração (ms): ");
+      Serial.println(averageIterationTime);
+      logToScreen("Tempo de 100 hashes (ms): " + String(averageIterationTime), TFT_WHITE, 1);
+      iterationStartTime = iterationEndTime;
+    }
   }
 }
 
-String sha256(String data) {
+String calculateSha256(String data) {
   SHA256 sha256;
   uint8_t hashBin[32];
   sha256.reset();
@@ -363,15 +433,26 @@ uint8_t* hexToBytes(String hex) {
 }
 
 bool isValidHash(uint8_t* hash, String target) {
-  uint8_t targetBin[32];
-  for (int i = 0; i < 32; i++) {
-    sscanf(&target[i * 2], "%2hhx", &targetBin[i]);
+  // Converte o alvo compactado para sua representação completa de 256 bits
+  uint32_t targetBits;
+  sscanf(target.c_str(), "%8x", &targetBits);
+  
+  uint8_t exponent = (targetBits >> 24) & 0xFF;
+  uint32_t coefficient = targetBits & 0xFFFFFF;
+  uint8_t targetFull[32] = {0};
+
+  if (exponent <= 3) {
+    coefficient >>= 8 * (3 - exponent);
+    memcpy(targetFull, &coefficient, 3);
+  } else {
+    memcpy(targetFull + (exponent - 3), &coefficient, 3);
   }
 
+  // Comparar o hash gerado com o alvo de dificuldade
   for (int i = 0; i < 32; i++) {
-    if (hash[i] < targetBin[i]) {
+    if (hash[31 - i] < targetFull[31 - i]) {
       return true;
-    } else if (hash[i] > targetBin[i]) {
+    } else if (hash[31 - i] > targetFull[31 - i]) {
       return false;
     }
   }
@@ -387,24 +468,56 @@ void submitBlock(uint32_t nonce) {
   String submitMessage = String("{\"id\": 3, \"method\": \"mining.submit\", \"params\": [\"") + workerName + "\", \"" + jobId + "\", \"" + formattedExtranonce2 + "\", \"" + formattedNtime + "\", \"" + formattedNonce + "\"]}\n";
   client.print(submitMessage);
   Serial.println("Enviado: " + submitMessage);
-  logToScreen("Enviado: " + submitMessage);
+  logToScreen("Enviado: " + submitMessage, TFT_ORANGE, 1);
 
   // Atualizar o tempo da última comunicação
   lastCommunicationMillis = millis();
   esp_task_wdt_reset();
+
+  // Ler resposta do servidor
+  String response = readStratumResponse();
+  if (response.length() > 0) {
+    Serial.println("Recebido: " + response);
+    logToScreen("Recebido: " + response, TFT_WHITE, 1);
+
+    // Parse JSON response
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, response);
+
+    if (error) {
+      Serial.print("Erro ao analisar JSON: ");
+      Serial.println(error.c_str());
+      logToScreen("Erro ao analisar JSON: " + String(error.c_str()), TFT_RED, 1);
+      return;
+    }
+
+    // Verificar se a submissão foi aceita
+    if (doc.containsKey("result") && doc["result"] == true) {
+      Serial.println("Submissão aceita pela pool!");
+      logToScreen("Submissão aceita pela pool!", TFT_GREEN, 2);
+    } else if (doc.containsKey("error") && doc["error"].is<JsonObject>()) {
+      String errorReason = doc["error"]["reject-reason"].as<String>();
+      Serial.println("Submissão rejeitada pela pool: " + errorReason);
+      logToScreen("Submissão rejeitada: " + errorReason, TFT_RED, 2);
+    }
+  }
 }
 
-void logToScreen(String message) {
+void logToScreen(String message, uint16_t color, uint8_t textSize) {
   for (int i = 0; i < MAX_LINES - 1; i++) {
     lines[i] = lines[i + 1];
   }
-  lines[MAX_LINES - 1] = message;
+  lines[MAX_LINES - 1].text = message;
+  lines[MAX_LINES - 1].color = color;
+  lines[MAX_LINES - 1].textSize = textSize;
   redrawScreen();
 }
 
 void clearScreen() {
   for (int i = 0; i < MAX_LINES; i++) {
-    lines[i] = "";
+    lines[i].text = "";
+    lines[i].color = TFT_WHITE;
+    lines[i].textSize = 1;
   }
   redrawScreen();
 }
@@ -416,7 +529,7 @@ void redrawScreen() {
   tft.fillRect(0, 0, 145, 30, TFT_GREEN);
   tft.setTextColor(TFT_BLACK, TFT_GREEN);
   tft.setTextSize(2);
-  tft.setCursor(10, 8);
+  tft.setCursor(6, 8);
   tft.println("GrANA MINER");
 
   // Desenha o hashrate, temperatura e memória livre com espaçamento de 50 pixels
@@ -425,17 +538,21 @@ void redrawScreen() {
   tft.setTextSize(2);
   tft.print("Hashrate:" + String(hashRate, 2) + "H/s");
   tft.setTextSize(1);
-  tft.setTextColor(TFT_RED, TFT_BLACK);
-  tft.print("  T:" + String(temperatureRead(), 1) + "C ");
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.print(" T:" + String(temperatureRead(), 1) + "C ");
   tft.print("MEM:" + String(ESP.getFreeHeap()) + "B");
 
-
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(1);
+  // Exibir hora atual e uso da CPU
+  timeStamp = String(hour()) + ":" + String(minute()) + ":" + String(second());
+  uint32_t freeHeap = ESP.getFreeHeap();
+  tft.setCursor(380, 21); // Ajuste de acordo com o tamanho da tela
+  tft.println("Hora:" + timeStamp);
 
   for (int i = 0; i < MAX_LINES; i++) {
+    tft.setTextColor(lines[i].color, TFT_BLACK);
+    tft.setTextSize(lines[i].textSize);
     tft.setCursor(0, (i + 2) * 16);
-    tft.println(lines[i]);
+    tft.println(lines[i].text);
   }
 }
 
@@ -467,7 +584,6 @@ void showLogo() {
   tft.setCursor(x, y);
   tft.setTextSize(2);
   tft.println("by SantoCyber");
-
   // Carrega o patternIndex do SPIFFS
   int patternIndex = loadPatternIndex();
   drawPattern(patternIndex);
@@ -475,7 +591,15 @@ void showLogo() {
   // Incrementa o índice e salva no SPIFFS
   patternIndex = (patternIndex + 1) % 5;
   savePatternIndex(patternIndex);
-
   delay(500);
   tft.fillScreen(TFT_BLACK);
+}
+
+void updateTimeFromNTP() {
+  while (!timeClient.update()) {
+    timeClient.forceUpdate();
+  }
+  setTime(timeClient.getEpochTime());
+  timeStamp = String(hour()) + ":" + String(minute()) + ":" + String(second());
+  Serial.println("Hora atualizada do servidor NTP.");
 }
